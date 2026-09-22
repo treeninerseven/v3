@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Build on Windows/Linux; add --port to flash. Requires Python 3.8+."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+
+ROOT = Path(__file__).resolve().parent
+BOARD = (
+    'STMicroelectronics:stm32:GenL0:pnum=GENERIC_L072RBTX,'
+    'xserial=none,upload_method=serialMethod'
+)
+INDEX = 'https://github.com/stm32duino/BoardManagerFiles/raw/main/package_stmicroelectronics_index.json'
+
+
+def find_tool(name, directories):
+    for directory in directories:
+        candidate = shutil.which(str(directory / name))
+        if candidate:
+            return candidate
+    return shutil.which(name)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--port', help='Upload port, e.g. COM5 or /dev/ttyUSB0; omit to build only')
+    args = parser.parse_args()
+    if sys.platform not in ('win32', 'linux'):
+        raise RuntimeError('This script supports Windows and Linux only.')
+
+    windows = sys.platform == 'win32'
+    # Reuse existing Windows files; isolate Linux tools and build cache.
+    tools = ROOT / '.tools' if windows else ROOT / '.tools' / 'linux'
+    build = ROOT / 'build' if windows else ROOT / 'build' / 'linux'
+    cli_name = 'arduino-cli.exe' if windows else 'arduino-cli'
+    cli = find_tool(cli_name, [tools, ROOT / '.tools'])
+    if not cli:
+        raise RuntimeError(
+            f'{cli_name} not found. Install Arduino CLI and add it to PATH, '
+            f'or place it in {tools}. On Linux it must be executable.'
+        )
+
+    env = os.environ.copy()
+    if args.port:
+        if windows:
+            name = 'STM32_Programmer_CLI.exe'
+            directories = [
+                Path(env.get(key, 'C:/Program Files'))
+                / 'STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin'
+                for key in ('ProgramFiles', 'ProgramW6432')
+            ]
+        else:
+            # The STM32 core's Linux uploader calls this wrapper, not the bare CLI.
+            name = 'STM32_Programmer.sh'
+            directories = [
+                Path.home() / 'STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin',
+                Path('/opt/stm32cubeprog/bin'),
+            ]
+        programmer = find_tool(name, directories)
+        if not programmer:
+            raise RuntimeError(
+                f'{name} not found. Install STM32CubeProgrammer and add its bin directory to PATH.'
+            )
+        env['PATH'] = str(Path(programmer).parent) + os.pathsep + env.get('PATH', '')
+
+    tools.mkdir(parents=True, exist_ok=True)
+    build.mkdir(parents=True, exist_ok=True)
+    config = tools / 'arduino-cli.yaml'
+    # JSON-quoted paths are valid YAML strings, including Windows backslashes.
+    config.write_text(
+        f'board_manager:\n  additional_urls:\n    - {INDEX}\n'
+        f'directories:\n  data: {json.dumps(str(tools / "data"))}\n'
+        f'  downloads: {json.dumps(str(tools / "downloads"))}\n'
+        f'  user: {json.dumps(str(ROOT))}\n',
+        encoding='utf-8',
+    )
+
+    def arduino(*arguments):
+        subprocess.run(
+            [cli, '--config-file', str(config), *map(str, arguments)],
+            env=env, check=True,
+        )
+
+    core = tools / 'data/packages/STMicroelectronics/hardware/stm32/3.0.0/platform.txt'
+    if not core.is_file():
+        print('Installing STM32 core 3.0.0 and its toolchain...', flush=True)
+        arduino('core', 'update-index')
+        arduino('core', 'install', 'STMicroelectronics:stm32@3.0.0')
+
+    sketch = ROOT / 'm3b_arduino'
+    print('Compiling with the project libraries...', flush=True)
+    arduino('compile', '--fqbn', BOARD, '--libraries', ROOT / 'libraries',
+            '--build-path', build, sketch)
+    if args.port:
+        input(f'Close serial monitors, enable Boot, press RESET, then press Enter to upload to {args.port}: ')
+        arduino('upload', '--fqbn', BOARD, '--port', args.port, '--input-dir', build, sketch)
+        print('Upload complete. Release the Boot switch and press RESET to start.')
+    else:
+        print(f'Build complete: {build}')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, RuntimeError, subprocess.CalledProcessError, EOFError) as error:
+        print(f'Error: {error}', file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print('\nCancelled.', file=sys.stderr)
+        sys.exit(130)
