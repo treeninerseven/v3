@@ -1,0 +1,65 @@
+// Standalone M3B USB-C CDC test: PA11 = D-, PA12 = D+.
+// Build with USB support = CDC (generic 'Serial' supersede U(S)ART).
+#include <Arduino.h>
+
+#if !defined(USBCON) || !defined(USBD_USE_CDC)
+#error "Enable USB CDC support, or select menu option 3 in build-flash."
+#endif
+
+static uint32_t lastReportMs = 0;
+static uint32_t reportCount = 0;
+static uint32_t receivedBytes = 0;
+static bool monitorWasOpen = false;
+
+void setup() {
+  // The generic L072 variant already selects HSI48 as the USB clock.
+  // Trim that internal oscillator against the host's 1 kHz USB SOF packets.
+  __HAL_RCC_CRS_CLK_ENABLE();
+  RCC_CRSInitTypeDef crs = {};
+  crs.Prescaler = RCC_CRS_SYNC_DIV1;
+  crs.Source = RCC_CRS_SYNC_SOURCE_USB;
+  crs.Polarity = RCC_CRS_SYNC_POLARITY_RISING;
+  crs.ReloadValue = __HAL_RCC_CRS_RELOADVALUE_CALCULATE(48000000, 1000);
+  crs.ErrorLimitValue = RCC_CRS_ERRORLIMIT_DEFAULT;
+  crs.HSI48CalibrationValue = RCC_CRS_HSI48CALIBRATION_DEFAULT;
+  HAL_RCCEx_CRSConfig(&crs);
+
+  SerialUSB.begin(115200); // CDC ignores the baud rate; use 115200 in the monitor.
+  // Do not wait here: the monitor can be opened at any time after boot.
+}
+
+void loop() {
+  const bool monitorOpen = static_cast<bool>(SerialUSB); // Host asserts DTR.
+  if (!monitorOpen) {
+    monitorWasOpen = false;
+    return;
+  }
+
+  if (!monitorWasOpen) {
+    SerialUSB.println("\r\nM3B USB-C SERIAL TEST");
+    SerialUSB.println("USB CDC ready. Heartbeat every 1 second.");
+    SerialUSB.println("Type text to test RX echo; use a newline when sending.");
+    monitorWasOpen = true;
+    lastReportMs = millis();
+  }
+
+  // Bound each batch so incoming data cannot starve the heartbeat.
+  for (unsigned int i = 0; i < 64 && SerialUSB.available() > 0; ++i) {
+    const int value = SerialUSB.read();
+    if (value >= 0) {
+      ++receivedBytes;
+      SerialUSB.write(static_cast<uint8_t>(value));
+    }
+  }
+
+  const uint32_t now = millis();
+  if (now - lastReportMs >= 1000) {
+    lastReportMs = now;
+    SerialUSB.print("[USB OK] count=");
+    SerialUSB.print(++reportCount);
+    SerialUSB.print(" uptime_ms=");
+    SerialUSB.print(now);
+    SerialUSB.print(" rx_bytes=");
+    SerialUSB.println(receivedBytes);
+  }
+}
