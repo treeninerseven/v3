@@ -1,0 +1,202 @@
+// SPDX-License-Identifier: MIT
+// Send fixed text over the mioty modem and show the result on OLED and USB CDC.
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+#include <miotyAtClient.h>
+#include <stdio.h>
+#include <string.h>
+
+#if !defined(USBCON) || !defined(USBD_USE_CDC)
+#error "Enable USB CDC support, or select menu option 4 in build-flash."
+#endif
+
+constexpr char FIXED_TEXT[] = "HELLO MIOTY";
+constexpr size_t PAYLOAD_LENGTH = sizeof(FIXED_TEXT) - 1;
+static_assert(PAYLOAD_LENGTH > 0 && PAYLOAD_LENGTH <= 21,
+              "Fixed text must fit one OLED row (1..21 ASCII bytes).");
+constexpr uint32_t SEND_INTERVAL_MS = 5000;
+constexpr uint32_t RF_TIMEOUT_MS = 20000;
+constexpr uint32_t STARTUP_MS = 2000;
+
+// OLED: SDA=PB9, SCL=PB8. RF UART: RX=PC11, TX=PC10.
+TwoWire OledWire(PB9, PB8);
+Adafruit_SH1107 display(64, 128, &OledWire);
+Uart SerialMioty(PC_11, PC_10);
+
+constexpr uint32_t BLUE_LED_PIN = PC6;
+constexpr uint32_t RED_LED_PIN = PC8;
+constexpr uint32_t GREEN_LED_PIN = PC7;
+constexpr uint32_t STATUS_LED_PIN = PC13;
+
+bool oledReady = false;
+bool firstSend = true;
+bool monitorWasOpen = false;
+uint32_t attempts = 0;
+uint32_t accepted = 0;
+uint32_t waitStarted = 0;
+uint32_t sendStarted = 0;
+char statusText[22] = "READY";
+
+// The bundled AT client owns frame encoding and response parsing. These two
+// callbacks connect it to the board's hardware UART and bound its read wait.
+extern "C" void miotyAtClientWrite(uint8_t *data, uint16_t length) {
+  SerialMioty.write(data, length);
+  SerialMioty.flush();
+}
+
+extern "C" bool miotyAtClientRead(uint8_t *data, uint8_t *length) {
+  const uint8_t capacity = *length;
+  uint8_t received = 0;
+  uint32_t lastByteAt = millis();
+  while (received < capacity && millis() - sendStarted < RF_TIMEOUT_MS) {
+    while (SerialMioty.available() > 0 && received < capacity) {
+      const int value = SerialMioty.read();
+      if (value >= 0) {
+        data[received++] = static_cast<uint8_t>(value);
+        lastByteAt = millis();
+      }
+    }
+    if (received && millis() - lastByteAt >= 8) break;
+    delay(1);
+  }
+  // Some modem replies end in CR alone; the v2 client expects CR LF.
+  if (received && data[received - 1] == '\r' && received < capacity) {
+    data[received++] = '\n';
+  }
+  *length = received;
+  return received != 0;
+}
+
+// Logging must never require a connected computer or hold up RF operation.
+void logStatus(const char *event) {
+  if (!SerialUSB.dtr()) return;
+  char text[160];
+  const int length = snprintf(text, sizeof(text),
+      "[%s] TEXT=%s TRY=%lu OK=%lu STATUS=%s OLED=%s UP_MS=%lu\r\n",
+      event, FIXED_TEXT, static_cast<unsigned long>(attempts),
+      static_cast<unsigned long>(accepted), statusText,
+      oledReady ? "INIT" : "INIT_FAIL", static_cast<unsigned long>(millis()));
+  if (length > 0 && static_cast<size_t>(length) < sizeof(text) &&
+      SerialUSB.availableForWrite() >= length) {
+    SerialUSB.write(reinterpret_cast<const uint8_t *>(text), length);
+  }
+}
+
+void initUsb() {
+  __HAL_RCC_CRS_CLK_ENABLE();
+  RCC_CRSInitTypeDef crs = {};
+  crs.Prescaler = RCC_CRS_SYNC_DIV1;
+  crs.Source = RCC_CRS_SYNC_SOURCE_USB;
+  crs.Polarity = RCC_CRS_SYNC_POLARITY_RISING;
+  crs.ReloadValue = __HAL_RCC_CRS_RELOADVALUE_CALCULATE(48000000, 1000);
+  crs.ErrorLimitValue = RCC_CRS_ERRORLIMIT_DEFAULT;
+  crs.HSI48CalibrationValue = RCC_CRS_HSI48CALIBRATION_DEFAULT;
+  HAL_RCCEx_CRSConfig(&crs);
+  SerialUSB.begin(115200);
+}
+
+void renderStatus() {
+  if (!oledReady) return;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SH110X_WHITE);
+  display.setTextWrap(false);
+  display.setCursor(0, 0);
+  display.print("M3B MIOTY / SH1107");
+  display.setCursor(0, 12);
+  display.print(FIXED_TEXT);
+  display.setCursor(0, 26);
+  display.print("TRY: ");
+  display.print(attempts);
+  display.setCursor(0, 36);
+  display.print("OK:  ");
+  display.print(accepted);
+  display.setCursor(0, 48);
+  display.print(statusText);
+  display.setCursor(0, 56);
+  display.print("INTERVAL: 5S");
+  display.display();
+}
+
+void finishSend(miotyAtClient_returnCode result) {
+  const bool ok = result == MIOTYATCLIENT_RETURN_CODE_OK;
+  if (ok) {
+    ++accepted;
+    strcpy(statusText, "RAW OK");
+  } else if (result == MIOTYATCLIENT_RETURN_CODE_ATReadFailed) {
+    strcpy(statusText, "TIMEOUT");
+  } else if (result >= MIOTYATCLIENT_RETURN_CODE_ATgenericErr &&
+             result <= MIOTYATCLIENT_RETURN_CODE_ATArgInvalid) {
+    snprintf(statusText, sizeof(statusText), "AT ERR:%d", static_cast<int>(result) - 16);
+  } else if (result >= MIOTYATCLIENT_RETURN_CODE_MacError &&
+             result <= MIOTYATCLIENT_RETURN_CODE_MacDefaultsNotSet) {
+    snprintf(statusText, sizeof(statusText), "MAC ERR:%d", static_cast<int>(result));
+  } else {
+    strcpy(statusText, "RF ERROR");
+  }
+  digitalWrite(BLUE_LED_PIN, HIGH);
+  digitalWrite(STATUS_LED_PIN, ok ? HIGH : LOW);
+  digitalWrite(RED_LED_PIN, ok ? HIGH : LOW);
+  waitStarted = millis();
+  renderStatus();
+  logStatus("RESULT");
+}
+
+void startSend() {
+  ++attempts;
+  firstSend = false;
+  strcpy(statusText, "SENDING");
+  logStatus("TX");
+  renderStatus();
+  while (SerialMioty.available() > 0) SerialMioty.read();
+  digitalWrite(RED_LED_PIN, HIGH);
+  digitalWrite(STATUS_LED_PIN, LOW);
+  digitalWrite(BLUE_LED_PIN, LOW);
+
+  uint8_t payload[PAYLOAD_LENGTH];
+  memcpy(payload, FIXED_TEXT, PAYLOAD_LENGTH);
+  uint32_t packetCounter = 0;
+  sendStarted = millis();
+  const miotyAtClient_returnCode result = miotyAtClient_sendMessageUniTransparent(
+      payload, static_cast<uint8_t>(PAYLOAD_LENGTH), &packetCounter);
+  finishSend(result);
+}
+
+void setup() {
+  pinMode(BLUE_LED_PIN, OUTPUT);
+  pinMode(RED_LED_PIN, OUTPUT);
+  pinMode(GREEN_LED_PIN, OUTPUT);
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  digitalWrite(BLUE_LED_PIN, HIGH);
+  digitalWrite(RED_LED_PIN, HIGH);
+  digitalWrite(GREEN_LED_PIN, HIGH);
+  digitalWrite(STATUS_LED_PIN, LOW);
+  initUsb();
+  SerialMioty.begin(9600);
+  OledWire.begin();
+  OledWire.setClock(100000);
+  delay(250);
+  oledReady = display.begin(0x3C, true);
+  if (oledReady) {
+    display.display();
+    delay(1000);
+    display.clearDisplay();
+    display.display();
+    display.setRotation(1);
+    display.setTextWrap(false);
+  }
+  waitStarted = millis();
+  renderStatus();
+  logStatus("BOOT");
+}
+
+void loop() {
+  const bool monitorOpen = SerialUSB.dtr();
+  if (monitorOpen && !monitorWasOpen) logStatus("USB CONNECTED");
+  monitorWasOpen = monitorOpen;
+  const uint32_t interval = firstSend ? STARTUP_MS : SEND_INTERVAL_MS;
+  if (millis() - waitStarted >= interval) startSend();
+  delay(1);
+}
