@@ -1,4 +1,3 @@
-// Source: extras/mioty-logo.png, alpha mask converted to a 1-bit OLED bitmap.
 #pragma once
 #include <Adafruit_GFX.h>
 
