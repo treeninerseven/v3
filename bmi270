@@ -1,0 +1,251 @@
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_SH110X.h>
+#include <MiotyLogo.h>
+#include <bmi270.h>
+#include <miotyAtClient.h>
+#include <math.h>
+
+constexpr uint8_t IMU_ADDRESS = 0x68, OLED_ADDRESS = 0x3C;
+constexpr uint16_t MOTION_THRESHOLD_MG = 250, ROTATION_THRESHOLD_DPS = 30;
+constexpr uint32_t REARM_QUIET_MS = 500, SEND_COOLDOWN_MS = 10000;
+constexpr uint32_t SAMPLE_INTERVAL_MS = 20, DISPLAY_INTERVAL_MS = 200;
+constexpr uint32_t I2C_CLOCK_HZ = 100000, IMU_INIT_TIMEOUT_MS = 8000, RF_TIMEOUT_MS = 20000;
+constexpr bool TRANSPARENT_UPLINK = true;
+TwoWire SensorWire(PB9, PB8);
+Adafruit_SH1107 display(64, 128, &SensorWire, -1, I2C_CLOCK_HZ, I2C_CLOCK_HZ);
+Uart SerialMioty(PC_11, PC_10);
+bmi2_dev imu = {};
+struct Sample { int16_t a[3], g[3]; } sample = {}, eventSample = {};
+float gravity[3] = {};
+uint8_t warmup = 0, consecutive = 0, oledPage = 16;
+bool armed = false, pending = false, sending = false, imuReady = false, oledReady = false, oledInitialized = false;
+uint16_t magnitude = 0, eventMagnitude = 0, rfBytes = 0;
+uint32_t quietSince = 0, initStarted = 0, lastSample = 0, lastData = 0, lastDisplay = 0;
+uint32_t lastImuAttempt = 0, lastOledRetry = 0, sendStarted = 0, sendFinished = 0, eventTime = 0;
+uint32_t attempts = 0, accepted = 0;
+int8_t imuError = BMI2_E_COM_FAIL;
+const char *rfStatus = "READY";
+
+int8_t imuRead(uint8_t reg, uint8_t *data, uint32_t length, void *) {
+  if (length > BUFFER_LENGTH || (initStarted && millis() - initStarted >= IMU_INIT_TIMEOUT_MS)) return -1;
+  delayMicroseconds(500); // Required bus idle/STOP settling time on this board.
+  SensorWire.beginTransmission(IMU_ADDRESS);
+  SensorWire.write(reg);
+  if (SensorWire.endTransmission(false)) return -1;
+  if (SensorWire.requestFrom(IMU_ADDRESS, size_t(length), true) != length) return -1;
+  for (uint32_t i = 0; i < length; ++i) data[i] = SensorWire.read();
+  delayMicroseconds(500);
+  return BMI2_INTF_RET_SUCCESS;
+}
+int8_t imuWrite(uint8_t reg, const uint8_t *data, uint32_t length, void *) {
+  if (length >= BUFFER_LENGTH || (initStarted && millis() - initStarted >= IMU_INIT_TIMEOUT_MS)) return -1;
+  delayMicroseconds(500);
+  SensorWire.beginTransmission(IMU_ADDRESS);
+  SensorWire.write(reg);
+  size_t written = SensorWire.write(data, length);
+  uint8_t error = SensorWire.endTransmission();
+  if (written != length || error) return -1;
+  if (reg == BMI2_CMD_REG_ADDR && length == 1 && data[0] == BMI2_SOFT_RESET_CMD) delay(10);
+  return BMI2_INTF_RET_SUCCESS;
+}
+void imuDelay(uint32_t us, void *) {
+  delay(us / 1000);
+  delayMicroseconds(us % 1000);
+}
+void initImu() {
+  SensorWire.end();
+  delay(1);
+  SensorWire.begin(); // The STM32 core also performs bus recovery here.
+  SensorWire.setClock(I2C_CLOCK_HZ);
+  oledPage = 16;
+  pending = armed = false;
+  warmup = consecutive = 0;
+  quietSince = 0;
+  magnitude = 0;
+  sample = {};
+  imu = {};
+  imu.intf = BMI2_I2C_INTF;
+  imu.read = imuRead;
+  imu.write = imuWrite;
+  imu.delay_us = imuDelay;
+  imu.read_write_len = 16;
+  initStarted = millis();
+  imuError = bmi270_init(&imu); // Official API verifies chip ID and uploads configuration.
+  bmi2_sens_config config[2] = {{BMI2_ACCEL}, {BMI2_GYRO}};
+  if (!imuError) imuError = bmi2_get_sensor_config(config, 2, &imu);
+  if (!imuError) {
+    config[0].cfg.acc.odr = BMI2_ACC_ODR_50HZ;
+    config[0].cfg.acc.range = BMI2_ACC_RANGE_4G;
+    config[1].cfg.gyr.odr = BMI2_GYR_ODR_100HZ;
+    config[1].cfg.gyr.range = BMI2_GYR_RANGE_500;
+    imuError = bmi2_set_sensor_config(config, 2, &imu);
+  }
+  const uint8_t sensors[] = {BMI2_ACCEL, BMI2_GYRO};
+  if (!imuError) imuError = bmi2_sensor_enable(sensors, 2, &imu);
+  initStarted = 0;
+  imuReady = !imuError;
+  lastImuAttempt = lastData = millis();
+}
+void detectMotion(uint32_t now) {
+  float acceleration = 0, rotation = 0;
+  for (uint8_t i = 0; i < 3; ++i) {
+    if (!warmup) gravity[i] = sample.a[i];
+    float delta = sample.a[i] - gravity[i];
+    acceleration += delta * delta;
+    rotation += float(sample.g[i]) * sample.g[i];
+    gravity[i] += 0.02f * delta;
+  }
+  magnitude = sqrtf(acceleration);
+  if (warmup < 50) {
+    armed = ++warmup == 50;
+    return;
+  }
+  if (!armed) {
+    bool quiet = magnitude < MOTION_THRESHOLD_MG / 2U && rotation < sq(ROTATION_THRESHOLD_DPS * 5U);
+    if (!quiet) quietSince = 0;
+    else if (!quietSince) quietSince = now;
+    else if (now - quietSince >= REARM_QUIET_MS) armed = true;
+    return;
+  }
+  bool moving = magnitude > MOTION_THRESHOLD_MG || rotation > sq(ROTATION_THRESHOLD_DPS * 10U);
+  consecutive = moving ? consecutive + 1 : 0;
+  if (consecutive < 3) return;
+  armed = false;
+  consecutive = 0;
+  quietSince = 0;
+  if (pending) return;
+  pending = true;
+  eventSample = sample;
+  eventMagnitude = magnitude;
+  eventTime = now / 1000;
+}
+void renderStatus() {
+  if (!oledReady || oledPage < 16) return;
+  lastDisplay = millis();
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  if (!imuReady) display.printf("IMU ERROR:%d\nNO DATA\n", imuError);
+  else {
+    display.printf("BMI270@%02X %s\n", IMU_ADDRESS, warmup < 50 ? "CAL" : pending ? "QUEUED" : armed ? "ARMED" : "WAIT");
+    display.printf("A mg:%5d%5d%5d\n", sample.a[0], sample.a[1], sample.a[2]);
+    display.printf("G d/s:%5d%5d%5d\n", sample.g[0] / 10, sample.g[1] / 10, sample.g[2] / 10);
+    display.printf("D:%u TH:%umg\n", magnitude, MOTION_THRESHOLD_MG);
+  }
+  display.printf("TX:%lu OK:%lu\n%s", (unsigned long)(attempts % 100000), (unsigned long)(accepted % 100000), rfStatus);
+  oledPage = 0;
+}
+void pollOled() { // One SH1107 page per call keeps RF reception and sampling responsive.
+  if (!oledReady || oledPage == 16) return;
+  const uint8_t command[] = {0, uint8_t(SH110X_SETPAGEADDR + oledPage), 0x10, 0};
+  SensorWire.beginTransmission(OLED_ADDRESS);
+  SensorWire.write(command, sizeof(command));
+  uint8_t error = SensorWire.endTransmission();
+  for (uint8_t offset = 0; offset < 64 && !error; offset += 16) {
+    SensorWire.beginTransmission(OLED_ADDRESS);
+    SensorWire.write(0x40);
+    SensorWire.write(display.getBuffer() + oledPage * 64 + offset, 16);
+    error = SensorWire.endTransmission();
+  }
+  oledReady = !error;
+  oledPage = error ? 16 : oledPage + 1;
+  if (error) lastOledRetry = millis();
+}
+void serviceDevices() {
+  uint32_t now = millis();
+  if (!imuReady && !sending && now - lastImuAttempt >= 5000)
+    initImu();
+  now = millis();
+  if (imuReady && now - lastSample >= SAMPLE_INTERVAL_MS) {
+    lastSample = now;
+    bmi2_sens_data data = {};
+    imuError = bmi2_get_sensor_data(&data, &imu);
+    if (!imuError && (data.status & 0xC0) == 0xC0) {
+      lastData = now;
+      const int16_t a[] = {data.acc.x, data.acc.y, data.acc.z}, g[] = {data.gyr.x, data.gyr.y, data.gyr.z};
+      for (uint8_t i = 0; i < 3; ++i) {
+        sample.a[i] = int32_t(a[i]) * 4000 / 32768;
+        sample.g[i] = int32_t(g[i]) * 5000 / 32768;
+      }
+      detectMotion(now);
+    } else if (imuError || now - lastData >= 500) {
+      if (!imuError) imuError = BMI2_E_DATA_RDY_INT_FAILED;
+      imuReady = pending = false;
+      lastImuAttempt = now;
+    }
+  }
+  if (!oledReady && oledInitialized && !sending && now - lastOledRetry >= 3000) {
+    lastOledRetry = now;
+    SensorWire.beginTransmission(OLED_ADDRESS);
+    oledReady = !SensorWire.endTransmission();
+  }
+  if (now - lastDisplay >= DISPLAY_INTERVAL_MS) renderStatus();
+  pollOled();
+}
+extern "C" void miotyAtClientWrite(uint8_t *data, uint16_t length) {
+  SerialMioty.write(data, length);
+}
+extern "C" bool miotyAtClientRead(uint8_t *data, uint8_t *length) {
+  uint8_t capacity = min(*length, uint8_t(199 - rfBytes));
+  *length = 0;
+  while (*length + 1 < capacity && millis() - sendStarted < RF_TIMEOUT_MS) {
+    if (SerialMioty.available()) {
+      data[(*length)++] = SerialMioty.read();
+      if (data[*length - 1] == '\r' || data[*length - 1] == '\n') break;
+    } else {
+      serviceDevices();
+      delay(1);
+    }
+  }
+  if (*length && data[*length - 1] == '\r') data[(*length)++] = '\n';
+  rfBytes += *length;
+  return *length != 0;
+}
+void storeBigEndian(uint8_t *p, uint32_t value, uint8_t bytes) {
+  for (uint8_t i = 0; i < bytes; ++i) p[i] = value >> ((bytes - 1 - i) * 8);
+}
+void sendMotion() {
+  uint8_t payload[23] = {2};
+  storeBigEndian(payload + 1, ++attempts, 4);
+  storeBigEndian(payload + 5, eventTime, 4);
+  for (uint8_t i = 0; i < 3; ++i) {
+    storeBigEndian(payload + 9 + i * 2, uint16_t(eventSample.a[i]), 2);
+    storeBigEndian(payload + 15 + i * 2, uint16_t(eventSample.g[i]), 2);
+  }
+  storeBigEndian(payload + 21, eventMagnitude, 2);
+  pending = false;
+  sending = true;
+  rfStatus = "SENDING";
+  while (SerialMioty.available()) SerialMioty.read();
+  rfBytes = 0;
+  sendStarted = millis();
+  uint32_t packetCounter = 0;
+  auto send = TRANSPARENT_UPLINK ? miotyAtClient_sendMessageUniTransparent : miotyAtClient_sendMessageUni;
+  bool ok = send(payload, sizeof(payload), &packetCounter) == MIOTYATCLIENT_RETURN_CODE_OK;
+  if (ok) ++accepted;
+  rfStatus = ok ? (TRANSPARENT_UPLINK ? "RAW OK" : "MODEM OK") : "RF ERROR";
+  sending = false;
+  sendFinished = millis();
+}
+void setup() {
+  SerialMioty.begin(9600);
+  delay(250);
+  oledInitialized = oledReady = display.begin(OLED_ADDRESS, true);
+  SensorWire.setClock(I2C_CLOCK_HZ);
+  if (oledReady) {
+    display.setRotation(1);
+    display.setTextColor(SH110X_WHITE);
+    display.setTextWrap(false);
+    display.clearDisplay();
+    M3BAssets::drawMiotyLogo(display);
+    oledPage = 0;
+    while (oledPage < 16) pollOled();
+  }
+  initImu();
+}
+void loop() {
+  serviceDevices();
+  if (pending && !sending && (!attempts || millis() - sendFinished >= SEND_COOLDOWN_MS)) sendMotion();
+  delay(1);
+}
