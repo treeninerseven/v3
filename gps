@@ -1,0 +1,222 @@
+// SPDX-License-Identifier: MIT
+// Adafruit Ultimate GPS FeatherWing #3133 
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_SH110X.h>
+#include <Adafruit_GPS.h>
+#include <MiotyLogo.h>
+#include <miotyAtClient.h>
+
+#if !defined(USBCON) || !defined(USBD_USE_CDC)
+#error "Enable USB CDC support, or select GPS firmware in build-flash."
+#endif
+
+constexpr uint32_t GPS_BAUD = 9600, SEND_INTERVAL_MS = 30000;
+constexpr uint32_t RF_TIMEOUT_MS = 20000, I2C_CLOCK_HZ = 100000;
+constexpr uint8_t OLED_ADDRESS = 0x3C;
+// Match menus 4/5/6. Set false for a modem configured for normal AT-U uplinks.
+constexpr bool TRANSPARENT_UPLINK = true;
+// Feather UART header: GPS TX -> PA10 (RX), GPS RX <- PA9 (TX).
+Uart SerialGps(PA_10, PA_9);
+Uart SerialMioty(PC_11, PC_10);
+TwoWire OledWire(PB9, PB8);
+Adafruit_SH1107 display(64, 128, &OledWire, -1, I2C_CLOCK_HZ, I2C_CLOCK_HZ);
+Adafruit_GPS gps(&SerialGps);
+bool oledReady = false, sending = false, rfHalted = false, monitorWasOpen = false;
+uint8_t oledPage = 16;
+uint16_t rfBytes = 0;
+uint32_t attempts = 0, accepted = 0, sendStarted = 0, sendFinished = 0;
+uint32_t lastDisplay = 0, lastLog = 0, parseErrors = 0;
+int rfError = 0;
+const char *rfStatus = "READY";
+
+void pollGps() {
+  // Bounded work also allows modem replies to be drained under noisy GPS input.
+  for (uint16_t i = 0; i < 256 && SerialGps.available(); ++i) {
+    gps.read();
+    if (gps.newNMEAreceived() && !gps.parse(gps.lastNMEA())) ++parseErrors;
+  }
+}
+
+const char *gpsStatus() {
+  return gps.fix ? "FIX" : "WAIT FIX";
+}
+
+// The library supplies speed in knots; the payload uses cm/s.
+uint16_t speedCms() { return uint16_t(gps.speed * (185200.0 / 3600.0) + 0.5); }
+
+// Use integer formatting so negative coordinates near zero keep their sign.
+void coordinateText(char *out, size_t size, int32_t e7) {
+  const uint32_t magnitude = e7 < 0 ? uint32_t(-int64_t(e7)) : uint32_t(e7);
+  snprintf(out, size, "%s%lu.%07lu", e7 < 0 ? "-" : "",
+           (unsigned long)(magnitude / 10000000U), (unsigned long)(magnitude % 10000000U));
+}
+
+void renderStatus() {
+  if (!oledReady || oledPage < 16) return;
+  lastDisplay = millis();
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.printf("GPS %s\n", gpsStatus());
+  if (gps.fix) {
+    char lat[16], lon[16];
+    coordinateText(lat, sizeof(lat), gps.latitude_fixed);
+    coordinateText(lon, sizeof(lon), gps.longitude_fixed);
+    const uint32_t kmh100 = (uint32_t(speedCms()) * 36U + 5U) / 10U;
+    display.printf("LAT %s\nLON %s\nSPD %lu.%02lu km/h\n", lat, lon,
+                   (unsigned long)(kmh100 / 100), (unsigned long)(kmh100 % 100));
+  } else display.print("LAT --\nLON --\nSPD --\n");
+  display.printf("TX:%lu OK:%lu\n%s\nINTERVAL:30S",
+                 (unsigned long)(attempts % 100000), (unsigned long)(accepted % 100000), rfStatus);
+  oledPage = 0;
+}
+
+// One 64-byte SH1107 page per call, with UART service between pages.
+void pollOled() {
+  if (!oledReady || oledPage == 16) return;
+  const uint8_t command[] = {0, uint8_t(SH110X_SETPAGEADDR + oledPage), 0x10, 0};
+  OledWire.beginTransmission(OLED_ADDRESS);
+  OledWire.write(command, sizeof(command));
+  uint8_t error = OledWire.endTransmission();
+  for (uint8_t offset = 0; offset < 64 && !error; offset += 16) {
+    OledWire.beginTransmission(OLED_ADDRESS);
+    OledWire.write(0x40);
+    OledWire.write(display.getBuffer() + oledPage * 64 + offset, 16);
+    error = OledWire.endTransmission();
+  }
+  oledReady = !error;
+  oledPage = error ? 16 : oledPage + 1;
+}
+
+void serviceDevices() {
+  pollGps();
+  if (millis() - lastDisplay >= 500) renderStatus();
+  pollOled();
+  pollGps();
+}
+
+// Small payloads use the existing mioty client's encoding and reply parser.
+extern "C" void miotyAtClientWrite(uint8_t *data, uint16_t length) {
+  SerialMioty.write(data, length);
+  SerialMioty.flush();
+  pollGps();
+}
+extern "C" bool miotyAtClientRead(uint8_t *data, uint8_t *length) {
+  const uint8_t capacity = *length;
+  *length = 0;
+  if (capacity < 2 || rfBytes >= 1024) return false;
+  while (*length + 1 < capacity && millis() - sendStarted < RF_TIMEOUT_MS) {
+    if (SerialMioty.available()) {
+      data[(*length)++] = SerialMioty.read();
+      if (data[*length - 1] == '\r' || data[*length - 1] == '\n') break;
+    } else {
+      serviceDevices();
+      delay(1);
+    }
+  }
+  if (*length && data[*length - 1] == '\r') data[(*length)++] = '\n';
+  rfBytes += *length;
+  return *length != 0;
+}
+
+void initUsb() {
+  __HAL_RCC_CRS_CLK_ENABLE();
+  RCC_CRSInitTypeDef crs = {};
+  crs.Prescaler = RCC_CRS_SYNC_DIV1;
+  crs.Source = RCC_CRS_SYNC_SOURCE_USB;
+  crs.Polarity = RCC_CRS_SYNC_POLARITY_RISING;
+  crs.ReloadValue = __HAL_RCC_CRS_RELOADVALUE_CALCULATE(48000000, 1000);
+  crs.ErrorLimitValue = RCC_CRS_ERRORLIMIT_DEFAULT;
+  crs.HSI48CalibrationValue = RCC_CRS_HSI48CALIBRATION_DEFAULT;
+  HAL_RCCEx_CRSConfig(&crs);
+  SerialUSB.begin(115200);
+}
+
+void logStatus(const char *event) {
+  if (!SerialUSB.dtr()) return;
+  char lat[16], lon[16], text[256];
+  const bool valid = gps.fix;
+  coordinateText(lat, sizeof(lat), gps.latitude_fixed);
+  coordinateText(lon, sizeof(lon), gps.longitude_fixed);
+  const int length = snprintf(text, sizeof(text),
+      "%s GPS=%s LAT=%s LON=%s SPEED_CMS=%u TRY=%lu OK=%lu RF=%s ERR=%d PARSE_ERR=%lu\r\n",
+      event, gpsStatus(), valid ? lat : "--", valid ? lon : "--", valid ? speedCms() : 0,
+      (unsigned long)attempts, (unsigned long)accepted, rfStatus, rfError, (unsigned long)parseErrors);
+  if (length > 0 && size_t(length) < sizeof(text) && SerialUSB.availableForWrite() >= length)
+    SerialUSB.write(reinterpret_cast<const uint8_t *>(text), length);
+}
+
+void storeBigEndian(uint8_t *out, uint32_t value, uint8_t bytes) {
+  for (uint8_t i = 0; i < bytes; ++i) out[i] = value >> ((bytes - 1 - i) * 8);
+}
+
+void sendPosition() {
+  pollGps();
+  if (!gps.fix) return;
+  // Read the library's fields directly into the existing 19-byte wire format.
+  uint8_t payload[19] = {4};
+  storeBigEndian(payload + 1, ++attempts, 4);
+  storeBigEndian(payload + 5, millis() / 1000U, 4);
+  storeBigEndian(payload + 9, uint32_t(gps.latitude_fixed), 4);
+  storeBigEndian(payload + 13, uint32_t(gps.longitude_fixed), 4);
+  storeBigEndian(payload + 17, speedCms(), 2);
+  sending = true;
+  rfStatus = "SENDING";
+  logStatus("TX");
+  while (SerialMioty.available()) SerialMioty.read();
+  rfBytes = 0;
+  sendStarted = millis();
+  uint32_t packetCounter = 0;
+  auto send = TRANSPARENT_UPLINK ? miotyAtClient_sendMessageUniTransparent : miotyAtClient_sendMessageUni;
+  const auto result = send(payload, sizeof(payload), &packetCounter);
+  rfError = int(result);
+  sending = false;
+  sendFinished = millis();
+  if (result == MIOTYATCLIENT_RETURN_CODE_OK) {
+    ++accepted;
+    rfStatus = TRANSPARENT_UPLINK ? "RAW OK" : "MODEM OK";
+  } else if (result == MIOTYATCLIENT_RETURN_CODE_ATReadFailed ||
+             result == MIOTYATCLIENT_RETURN_CODE_BufferSizeInsufficient || rfBytes >= 1024 ||
+             millis() - sendStarted >= RF_TIMEOUT_MS) {
+    // Stop until RESET so a delayed response cannot acknowledge the next packet.
+    rfHalted = true;
+    rfStatus = "RF HALT: RESET";
+  } else rfStatus = "RF ERROR";
+  logStatus("RESULT");
+}
+
+void setup() {
+  initUsb();
+  SerialMioty.begin(9600);
+  gps.begin(GPS_BAUD);
+  // Allow power-up, then request a coherent position + speed sentence at 1 Hz.
+  delay(500);
+  gps.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCONLY);
+  gps.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
+  OledWire.begin();
+  OledWire.setClock(I2C_CLOCK_HZ);
+  oledReady = display.begin(OLED_ADDRESS, true);
+  OledWire.setClock(I2C_CLOCK_HZ);
+  if (oledReady) {
+    display.setRotation(1);
+    display.setTextColor(SH110X_WHITE);
+    display.setTextWrap(false);
+    display.clearDisplay();
+    M3BAssets::drawMiotyLogo(display);
+    oledPage = 0;
+  }
+  pollGps();
+}
+
+void loop() {
+  serviceDevices();
+  const bool monitorOpen = SerialUSB.dtr();
+  if (monitorOpen && (!monitorWasOpen || millis() - lastLog >= 1000)) {
+    logStatus("GPS");
+    lastLog = millis();
+  }
+  monitorWasOpen = monitorOpen;
+  if (!rfHalted && !sending && gps.fix && millis() >= 2000 &&
+      (!attempts || millis() - sendFinished >= SEND_INTERVAL_MS)) sendPosition();
+  delay(1);
+}
