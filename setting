@@ -1,0 +1,627 @@
+// SPDX-License-Identifier: MIT
+// M3B + Adafruit 128x64 SH1107 OLED FeatherWing, three buttons.
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+#include <MiotyLogo.h>
+#include <miotyAtClient.h>
+#include <stdio.h>
+#include <string.h>
+#include "SettingsCore.h"
+
+#if !defined(USBCON) || !defined(USBD_USE_CDC)
+#error "Enable USB CDC support, or select menu option 9 in build-flash."
+#endif
+
+using namespace SettingsCore;
+constexpr uint32_t BUTTON_UP = PB4, BUTTON_DOWN = PB6, BUTTON_OK = PC9;
+constexpr uint32_t BLUE_LED = PC6, GREEN_LED = PC7, RED_LED = PC8, STATUS_LED = PC13;
+constexpr uint32_t START_DELAY_MS = 3000;
+constexpr uint32_t RF_TIMEOUT_MS = 120000;
+constexpr uint32_t CONFIG_TIMEOUT_MS = 5000;
+constexpr uint32_t PROFILE_GUARD_MS = 15000;
+constexpr uint32_t PROFILE_RETRY_MS = 10000;
+constexpr uint8_t PROFILE_MAX_TRIES = 3;
+constexpr uint32_t LED_PULSE_MS = 200;
+
+TwoWire OledWire(PB9, PB8);
+Adafruit_SH1107 display(64, 128, &OledWire);
+Uart SerialMioty(PC_11, PC_10);
+
+struct Settings {
+  uint8_t mode = 0, profile = 0, payload = 0, interval = 0;
+  bool downlink = false;
+};
+Settings active, draft;
+bool modeKnown = false, profileKnown = false, oledReady = false;
+enum class Page { Home, Settings, Choice };
+Page page = Page::Home;
+bool applying = false, rfHalted = false;
+uint8_t menuRow = 0, choiceRow = 0, attemptsAtConfig = 0, pendingRfSetting = 0;
+uint32_t txCount = 0, txOk = 0, rxCount = 0;
+uint32_t lastTxStart = 0, lastTxDone = 0, lastRender = 0, noticeUntil = 0;
+uint32_t configEarliest = 0;
+uint32_t atStarted = 0;
+uint16_t atReceived = 0;
+bool atOverflow = false, atPendingLf = false, atSkipLf = false;
+bool txActive = false, everSent = false;
+bool txPending = false;  // Coalesce edits during a TX into one send with the latest values.
+bool txRequestedDownlink = false;
+char stateText[22] = "BOOT";
+char noticeText[22] = "";
+int16_t lastError = 0;
+bool resultLedOn = false, blueLedOn = false;
+uint32_t resultLedStarted = 0, blueLedStarted = 0;
+
+// Complete records are queued so a slow USB host cannot block the RF client.
+char usbQueue[1024];
+size_t usbRead = 0, usbWrite = 0;
+bool monitorWasOpen = false;
+uint32_t droppedLogs = 0;
+
+void queueUsb(const char *text, size_t length) {
+  if (!SerialUSB.dtr()) return;
+  const size_t used = (usbWrite + sizeof(usbQueue) - usbRead) % sizeof(usbQueue);
+  if (length > sizeof(usbQueue) - used - 1) { ++droppedLogs; return; }
+  for (size_t i = 0; i < length; ++i) {
+    usbQueue[usbWrite] = text[i];
+    usbWrite = (usbWrite + 1) % sizeof(usbQueue);
+  }
+}
+
+void serviceUsb() {
+  const bool open = SerialUSB.dtr();
+  if (!open) { usbRead = usbWrite = 0; droppedLogs = 0; }
+  if (open && !monitorWasOpen) {
+    const char banner[] = "M3B MIOTY SETTINGS USB 115200; downlink data is HEX\r\n";
+    queueUsb(banner, sizeof(banner) - 1);
+  }
+  monitorWasOpen = open;
+  if (!open) return;
+  if (droppedLogs && usbRead == usbWrite) {
+    char text[64];
+    const int length = snprintf(text, sizeof(text), "[USB] dropped_logs=%lu\r\n", static_cast<unsigned long>(droppedLogs));
+    droppedLogs = 0;
+    if (length > 0 && static_cast<size_t>(length) < sizeof(text)) queueUsb(text, length);
+  }
+  const int capacity = SerialUSB.availableForWrite();
+  if (capacity > 0 && usbRead != usbWrite) {
+    size_t count = usbWrite > usbRead ? usbWrite - usbRead : sizeof(usbQueue) - usbRead;
+    if (count > static_cast<size_t>(capacity)) count = capacity;
+    if (count > 64) count = 64;
+    const size_t written = SerialUSB.write(reinterpret_cast<const uint8_t *>(usbQueue + usbRead), count);
+    usbRead = (usbRead + written) % sizeof(usbQueue);
+  }
+}
+
+void logTxResult(int16_t result, const uint8_t *downlink, uint8_t length) {
+  serviceUsb();
+  if (!SerialUSB.dtr()) return;
+  char text[600];
+  const int header = snprintf(text, sizeof(text), "[MIOTY] TX=%lu RESULT=%d DL=%s RX_LEN=%u HEX=",
+      static_cast<unsigned long>(txCount), result, txRequestedDownlink ? "ON" : "OFF", length);
+  if (header <= 0 || static_cast<size_t>(header) + 2 * length + 4 >= sizeof(text)) { ++droppedLogs; return; }
+  size_t pos = header;
+  if (length > 245 || (length && !downlink)) {
+    const char invalid[] = "INVALID LENGTH";
+    memcpy(text + pos, invalid, sizeof(invalid) - 1); pos += sizeof(invalid) - 1;
+  } else if (!length) text[pos++] = '-';
+  else {
+    const char hex[] = "0123456789ABCDEF";
+    for (uint16_t i = 0; i < length; ++i) {
+      text[pos++] = hex[downlink[i] >> 4];
+      text[pos++] = hex[downlink[i] & 15];
+    }
+  }
+  text[pos++] = '\r'; text[pos++] = '\n';
+  queueUsb(text, pos);
+}
+
+void initUsb() {
+  __HAL_RCC_CRS_CLK_ENABLE();
+  RCC_CRSInitTypeDef crs = {};
+  crs.Prescaler = RCC_CRS_SYNC_DIV1;
+  crs.Source = RCC_CRS_SYNC_SOURCE_USB;
+  crs.Polarity = RCC_CRS_SYNC_POLARITY_RISING;
+  crs.ReloadValue = __HAL_RCC_CRS_RELOADVALUE_CALCULATE(48000000, 1000);
+  crs.ErrorLimitValue = RCC_CRS_ERRORLIMIT_DEFAULT;
+  crs.HSI48CalibrationValue = RCC_CRS_HSI48CALIBRATION_DEFAULT;
+  HAL_RCCEx_CRSConfig(&crs);
+  SerialUSB.begin(115200);
+}
+
+// Button events are created only after a stable press. Release is required
+// before another event, so holding a button cannot accidentally apply twice.
+struct Button {
+  uint32_t pin;
+  bool raw = false, stable = false;
+  uint32_t changedAt = 0;
+  bool press() {
+    const bool now = digitalRead(pin) == LOW;
+    if (now != raw) { raw = now; changedAt = millis(); }
+    if (now != stable && millis() - changedAt >= 30) {
+      stable = now;
+      return stable;
+    }
+    return false;
+  }
+};
+Button keys[] = {{BUTTON_UP}, {BUTTON_DOWN}, {BUTTON_OK}};
+
+void leds(bool success, bool failure) {
+  digitalWrite(GREEN_LED, success ? LOW : HIGH);
+  digitalWrite(RED_LED, failure ? LOW : HIGH);
+  digitalWrite(STATUS_LED, success ? HIGH : LOW);
+  resultLedOn = success || failure;
+  if (resultLedOn) resultLedStarted = millis();
+}
+
+void updateLeds() {
+  const uint32_t now = millis();
+  if (resultLedOn && now - resultLedStarted >= LED_PULSE_MS) leds(false, false);
+  if (blueLedOn && now - blueLedStarted >= LED_PULSE_MS) {
+    digitalWrite(BLUE_LED, HIGH);
+    blueLedOn = false;
+  }
+}
+
+void notice(const char *message, int16_t error = 0) {
+  strncpy(noticeText, message, sizeof(noticeText) - 1);
+  noticeText[sizeof(noticeText) - 1] = 0;
+  lastError = error;
+  noticeUntil = millis() + 4000;
+  leds(error == 0, error != 0);
+}
+
+void writeState(const char *message) {
+  if (rfHalted) message = "RF HALT: RESET";
+  strncpy(stateText, message, sizeof(stateText) - 1);
+  stateText[sizeof(stateText) - 1] = 0;
+}
+
+void buttons();
+void render();
+
+// The library owns all command encoding and reply parsing. These callbacks
+// provide UART transport, CR/LF normalization, bounded waits and UI servicing.
+extern "C" void miotyAtClientWrite(uint8_t *data, uint16_t length) {
+  while (SerialMioty.available()) SerialMioty.read();
+  atStarted = millis();
+  atReceived = 0;
+  atOverflow = atPendingLf = atSkipLf = false;
+  // Service LED deadlines even while the library writes a long command.
+  uint16_t offset = 0;
+  while (offset < length) {
+    const uint16_t count = length - offset > 32 ? 32 : length - offset;
+    offset += SerialMioty.write(data + offset, count);
+    updateLeds();
+  }
+  SerialMioty.flush();
+  updateLeds();
+}
+
+extern "C" bool miotyAtClientRead(uint8_t *data, uint8_t *length) {
+  // The bundled client's reply buffers hold 200 bytes including the NUL.
+  if (atReceived >= 199) { atOverflow = true; *length = 0; return false; }
+  uint8_t capacity = *length;
+  if (capacity > 199 - atReceived) capacity = 199 - atReceived;
+  uint8_t used = 0;
+  uint32_t lastByte = millis();
+  const uint32_t timeout = txActive ? RF_TIMEOUT_MS : CONFIG_TIMEOUT_MS;
+  while (used < capacity && millis() - atStarted < timeout) {
+    updateLeds();
+    if (atPendingLf) { data[used++] = '\n'; atPendingLf = false; continue; }
+    if (SerialMioty.available()) {
+      const int c = SerialMioty.read();
+      if (c < 0) continue;
+      lastByte = millis();
+      if (atSkipLf && c == '\n') { atSkipLf = false; continue; }
+      atSkipLf = false;
+      if (c == '\r' || c == '\n') {
+        data[used++] = '\r'; atPendingLf = true; atSkipLf = c == '\r';
+      } else data[used++] = static_cast<uint8_t>(c);
+      continue;
+    }
+    if (used && millis() - lastByte >= 8) break;
+    buttons();
+    serviceUsb();
+    render();
+    delay(1);
+  }
+  atReceived += used;
+  *length = used;
+  return used != 0;
+}
+
+int16_t clientResult(miotyAtClient_returnCode result) {
+  if (atOverflow) { rfHalted = true; return -24; }
+  if (result == MIOTYATCLIENT_RETURN_CODE_ATReadFailed) { rfHalted = true; return -23; }
+  return static_cast<int16_t>(result);
+}
+
+int16_t configureRf(uint8_t setting, uint32_t &value, bool set) {
+  return clientResult(setting == 0 ? miotyAtClient_uplinkMode(&value, set)
+                                   : miotyAtClient_uplinkProfile(&value, set));
+}
+
+void showInterval(uint8_t index) {
+  if (index == 3) display.print("10min");
+  else if (index == 4) display.print("30min");
+  else { display.print(INTERVALS_MS[index] / 1000); display.print('s'); }
+}
+
+const char *settingName(uint8_t row) {
+  switch (row) {
+    case 0: return "MODE";
+    case 1: return "PROFILE";
+    case 2: return "DOWNLINK";
+    case 3: return "PAYLOAD";
+    default: return "INTERVAL";
+  }
+}
+
+const char *modeName(uint8_t mode) {
+  return mode == 0 ? "Standard" : "Low Latency";
+}
+
+uint8_t currentChoiceRow() {
+  switch (menuRow) {
+    case 0: return active.mode;
+    case 1: return active.profile;
+    case 2: return active.downlink ? 1 : 0;
+    case 3: return active.payload;
+    default: return active.interval - firstAllowedInterval(active.payload);
+  }
+}
+
+void showChoice(uint8_t row) {
+  switch (menuRow) {
+    case 0: display.print(modeName(row)); break;
+    case 1: display.print(row); break;
+    case 2: display.print(row ? "ON" : "OFF"); break;
+    case 3: display.print(PAYLOADS[row]); display.print(" bytes"); break;
+    default: showInterval(intervalFromOption(active.payload, row)); break;
+  }
+}
+
+void render() {
+  if (!oledReady || millis() - lastRender < 150) return;
+  lastRender = millis();
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SH110X_WHITE);
+  display.setTextWrap(false);
+  display.setCursor(0, 0);
+  if (page == Page::Settings) {
+    if (rfHalted) display.println("RF HALT: RESET");
+    else if (static_cast<int32_t>(noticeUntil - millis()) > 0) display.println(noticeText);
+    const Settings &s = active;
+    for (uint8_t row = 0; row < 6; ++row) {
+      display.setCursor(0, 8 + row * 8);
+      display.print(menuRow == row ? '>' : ' ');
+      switch (row) {
+        case 0:
+          display.print("Mode: ");
+          if (modeKnown) display.print(modeName(s.mode)); else display.print('?');
+          break;
+        case 1:
+          display.print("Profile: ");
+          if (profileKnown) display.print(s.profile); else display.print('?');
+          break;
+        case 2: display.print("Downlink: "); display.print(s.downlink ? "ON" : "OFF"); break;
+        case 3: display.print("Payload: "); display.print(PAYLOADS[s.payload]); display.print('B'); break;
+        case 4: display.print("Interval: "); showInterval(s.interval); break;
+        default: display.print("Back"); break;
+      }
+    }
+    if (applying) {
+      display.setCursor(0, 56);
+      display.print(attemptsAtConfig ? "RETRY IN:" : "RF WAIT:");
+      const uint32_t remaining = static_cast<int32_t>(configEarliest - millis()) > 0
+          ? (configEarliest - millis() + 999) / 1000 : 0;
+      display.print(remaining); display.print('s');
+    }
+  } else if (page == Page::Choice) {
+    if (rfHalted) display.println("RF HALT: RESET");
+    else if (static_cast<int32_t>(noticeUntil - millis()) > 0) display.println(noticeText);
+    else display.println(settingName(menuRow));
+    const uint8_t count = optionCount(menuRow, active.payload);
+    const uint8_t selected = currentChoiceRow();
+    for (uint8_t row = 0; row <= count; ++row) {
+      display.setCursor(0, 8 + row * 8);
+      display.print(choiceRow == row ? '>' : ' ');
+      if (row == count) display.print("Back");
+      else {
+        showChoice(row);
+        if (row == selected && (menuRow != 0 || modeKnown) && (menuRow != 1 || profileKnown)) display.print("  *");
+      }
+    }
+  } else {
+    display.println("MIOTY  OK:SETTINGS");
+    display.print("M:");
+    if (modeKnown) display.print(active.mode == 0 ? "STD" : "LL"); else display.print('?');
+    display.print(" P:"); if (profileKnown) display.print(active.profile); else display.print('?');
+    display.print(" DL:"); display.println(active.downlink ? "ON" : "OFF");
+    display.print("SIZE:"); display.print(PAYLOADS[active.payload]);
+    display.print(" GAP:"); showInterval(active.interval); display.println();
+    display.print("TX:"); display.print(txCount); display.print(" OK:"); display.println(txOk);
+    if (active.downlink) {
+      display.print("RX:"); display.print(rxCount); display.print(" E:"); display.println(lastError);
+    } else {
+      display.print("ERR:"); display.println(lastError);
+    }
+    display.print("STATE:"); display.println(stateText);
+    if (applying) {
+      display.print(attemptsAtConfig ? "RETRY IN:" : "RF WAIT:");
+      const uint32_t remaining = static_cast<int32_t>(configEarliest - millis()) > 0
+          ? (configEarliest - millis() + 999) / 1000 : 0;
+      display.print(remaining); display.println('s');
+    } else if (rfHalted) display.println("RF HALT: RESET");
+    else if (!modeKnown || !profileKnown) display.println("SET MODE/PROFILE");
+    else if (txActive) display.println("RF WAIT");
+    else {
+      const uint32_t interval = everSent ? INTERVALS_MS[active.interval] : START_DELAY_MS;
+      const uint32_t elapsed = millis() - (everSent ? lastTxStart : lastTxDone);
+      display.print("NEXT:"); display.print(elapsed >= interval ? 0 : (interval - elapsed + 999) / 1000);
+      display.println('s');
+    }
+    if (static_cast<int32_t>(noticeUntil - millis()) > 0) {
+      display.setCursor(0, 56);
+      display.print(noticeText);
+    }
+  }
+  display.display();
+}
+
+void chooseValue(Settings &settings, uint8_t row) {
+  switch (menuRow) {
+    case 0: settings.mode = row; break;
+    case 1: settings.profile = row; break;
+    case 2: settings.downlink = row != 0; break;
+    case 3: {
+      settings.payload = row;
+      const uint8_t minimum = firstAllowedInterval(settings.payload);
+      if (settings.interval < minimum) settings.interval = minimum;
+      break;
+    }
+    case 4: settings.interval = intervalFromOption(settings.payload, row); break;
+  }
+}
+
+void buttons() {
+  const bool up = keys[0].press(), down = keys[1].press(), ok = keys[2].press();
+  if (!up && !down && !ok) return;
+  if (applying) {
+    if (page == Page::Settings) {
+      if (up) menuRow = moveSelection(menuRow, 6, -1);
+      if (down) menuRow = moveSelection(menuRow, 6, 1);
+      if (ok && menuRow == 5) page = Page::Home;
+    } else if (page == Page::Home && ok) {
+      page = Page::Settings;
+      menuRow = 0;
+    }
+    return;
+  }
+  if (page == Page::Home) {
+    if (ok) { page = Page::Settings; menuRow = 0; noticeUntil = 0; }
+    return;
+  }
+  if (page == Page::Choice) {
+    const uint8_t count = optionCount(menuRow, active.payload);
+    if (up) choiceRow = moveSelection(choiceRow, count + 1, -1);
+    if (down) choiceRow = moveSelection(choiceRow, count + 1, 1);
+    if (ok) {
+      if (choiceRow == count) { page = Page::Settings; return; }
+      Settings selected = active;
+      chooseValue(selected, choiceRow);
+      if (!valid(selected.payload, selected.interval)) {
+        page = Page::Settings;
+        notice("INVALID GAP", -100);
+        return;
+      }
+      if (menuRow == 0 || menuRow == 1) {
+        if (rfHalted) {
+          page = Page::Settings;
+          notice("RF HALT: RESET", lastError);
+          return;
+        }
+        if ((menuRow == 0 && modeKnown && selected.mode == active.mode) ||
+            (menuRow == 1 && profileKnown && selected.profile == active.profile)) {
+          page = Page::Settings;
+          notice("ALREADY SET");
+          return;
+        }
+        draft = selected;
+        pendingRfSetting = menuRow;
+        applying = true;
+        attemptsAtConfig = 0;
+        configEarliest = everSent ? lastTxDone + PROFILE_GUARD_MS : millis();
+        writeState("WAIT RF / CONFIG");
+        page = Page::Settings;
+      } else {
+        const bool sendChanged = selected.payload != active.payload || selected.interval != active.interval;
+        active = selected;
+        draft = active;
+        if (sendChanged) txPending = true;
+        page = Page::Settings;
+        if (!txActive) writeState(modeKnown && profileKnown ? "READY" : "SET MODE/PROFILE");
+        else if (menuRow == 2) writeState(txRequestedDownlink ? "TX / RX WAIT" : "TX SENDING");
+        if (rfHalted) notice("RF HALT: RESET", lastError);
+        else notice("APPLIED");
+      }
+    }
+    return;
+  }
+  if (up) menuRow = moveSelection(menuRow, 6, -1);
+  if (down) menuRow = moveSelection(menuRow, 6, 1);
+  if (!ok) return;
+  if (menuRow < 5) {
+    choiceRow = currentChoiceRow();
+    page = Page::Choice;
+    noticeUntil = 0;
+    return;
+  }
+  page = Page::Home;
+}
+
+void completeTx(int16_t result, uint8_t downlinkSize) {
+  txActive = false;
+  lastTxDone = millis();
+  if (applying) configEarliest = lastTxDone + PROFILE_GUARD_MS;
+  digitalWrite(BLUE_LED, HIGH);
+  blueLedOn = false;
+  const bool noDownlink = txRequestedDownlink &&
+      result == MIOTYATCLIENT_RETURN_CODE_MacNoDownlinkReceived;
+  if (result == MIOTYATCLIENT_RETURN_CODE_OK || noDownlink) {
+    const bool received = txRequestedDownlink && result == MIOTYATCLIENT_RETURN_CODE_OK && downlinkSize > 0;
+    ++txOk;
+    if (received) ++rxCount;
+    writeState(active.downlink && txRequestedDownlink
+        ? (received ? "TX OK / RX DATA" : "TX OK / NO RX") : "TX OK");
+    notice("TX SUCCESS");
+  } else {
+    writeState("TX FAILED");
+    char message[22]; snprintf(message, sizeof(message), "TX ERR:%d", result);
+    notice(message, result);
+  }
+}
+
+void startTx() {
+  uint8_t payload[245] = {};
+  const uint8_t count = PAYLOADS[active.payload];
+  const uint32_t sequence = txCount + 1;
+  payload[0] = 0x06;
+  payload[1] = count;
+  for (uint8_t i = 0; i < 4; ++i) payload[2 + i] = sequence >> (24 - 8 * i);
+  for (uint16_t i = 6; i < count; ++i) payload[i] = static_cast<uint8_t>(i ^ sequence);
+  txRequestedDownlink = active.downlink;
+  txActive = true; everSent = true;
+  lastTxStart = millis();
+  txPending = false;
+  ++txCount;
+  digitalWrite(BLUE_LED, LOW);
+  blueLedOn = true;
+  blueLedStarted = millis();
+  leds(false, false);
+  writeState(txRequestedDownlink ? "TX / RX WAIT" : "TX SENDING");
+
+  uint32_t packetCounter = 0;
+  if (txRequestedDownlink) {
+    uint8_t downlink[245] = {};
+    uint8_t downlinkSize = sizeof(downlink);
+    const miotyAtClient_returnCode result = miotyAtClient_sendMessageBidiTransparent(
+        payload, count, downlink, &downlinkSize, &packetCounter);
+    const int16_t code = clientResult(result);
+    completeTx(code, downlinkSize);
+    logTxResult(code, downlink, code == MIOTYATCLIENT_RETURN_CODE_OK ? downlinkSize : 0);
+  } else {
+    const miotyAtClient_returnCode result = miotyAtClient_sendMessageUniTransparent(payload, count, &packetCounter);
+    const int16_t code = clientResult(result);
+    completeTx(code, 0);
+    logTxResult(code, nullptr, 0);
+  }
+}
+
+void applySettings() {
+  if (!applying) return;
+  if (rfHalted) { applying = false; return; }
+  if (txActive || static_cast<int32_t>(millis() - configEarliest) < 0) return;
+  ++attemptsAtConfig;
+  writeState("CONFIG RF");
+  // Invalidate before writing: even a failed reply may follow a successful write.
+  bool &known = pendingRfSetting == 0 ? modeKnown : profileKnown;
+  uint8_t &current = pendingRfSetting == 0 ? active.mode : active.profile;
+  const uint8_t requested = pendingRfSetting == 0 ? draft.mode : draft.profile;
+  known = false;
+  uint32_t value = requested;
+  int16_t result = configureRf(pendingRfSetting, value, true);
+  if (result == 0) {
+    result = configureRf(pendingRfSetting, value, false);
+    if (result == 0 && value != requested) result = -103;
+    if (result == 0) { current = requested; known = true; }
+  }
+  if (result == 0) {
+    applying = false;
+    writeState(modeKnown && profileKnown ? "READY" : "SET MODE/PROFILE");
+    notice("CONFIG APPLIED");
+    return;
+  }
+  if (attemptsAtConfig < PROFILE_MAX_TRIES && !rfHalted) {
+    configEarliest = millis() + PROFILE_RETRY_MS;
+    lastError = static_cast<int16_t>(result);
+    char message[22]; snprintf(message, sizeof(message), "RETRY ERR:%d", static_cast<int>(result));
+    writeState(message);
+    leds(false, true);
+  } else {
+    applying = false;
+    writeState(rfHalted ? "RF HALT: RESET" : "CONFIG FAILED");
+    char message[22]; snprintf(message, sizeof(message), "CFG ERR:%d", static_cast<int>(result));
+    notice(message, static_cast<int16_t>(result));
+  }
+}
+
+void setup() {
+  pinMode(BLUE_LED, OUTPUT); pinMode(GREEN_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT); pinMode(STATUS_LED, OUTPUT);
+  digitalWrite(BLUE_LED, HIGH); leds(false, false);
+  initUsb();
+  for (Button &button : keys) pinMode(button.pin, INPUT_PULLUP);
+  OledWire.begin(); OledWire.setClock(100000);
+  // A warm MCU reset can leave the OLED showing its previous framebuffer.
+  // Blank it before the library initializes the controller.
+  OledWire.beginTransmission(0x3C);
+  OledWire.write(static_cast<uint8_t>(0x00));
+  OledWire.write(static_cast<uint8_t>(SH110X_DISPLAYOFF));
+  OledWire.endTransmission();
+  delay(250);
+  oledReady = display.begin(0x3C, true, false);
+  if (oledReady) {
+    display.setRotation(1);
+    display.clearDisplay();
+    M3BAssets::drawMiotyLogo(display);
+    display.display();
+    display.oled_command(SH110X_DISPLAYON);
+    delay(1200);
+  }
+  SerialMioty.begin(9600);
+  delay(800);
+  uint32_t value = 0;
+  int16_t result = configureRf(0, value, false);
+  if (result == 0 && value <= 1) {
+    active.mode = static_cast<uint8_t>(value); modeKnown = true;
+  } else {
+    const int16_t code = result ? static_cast<int16_t>(result) : -101;
+    char message[22]; snprintf(message, sizeof(message), "MODE ERR:%d", code);
+    notice(message, code);
+  }
+  if (!rfHalted) {
+    result = configureRf(1, value, false);
+    if (result == 0 && value <= 3) {
+      active.profile = static_cast<uint8_t>(value); profileKnown = true;
+    } else {
+      const int16_t code = result ? result : -102;
+      char message[22]; snprintf(message, sizeof(message), "PROF ERR:%d", code); notice(message, code);
+    }
+  }
+  draft = active;
+  lastTxDone = millis();
+  writeState(rfHalted ? "RF HALT: RESET" : modeKnown && profileKnown ? "READY" : "SET MODE/PROFILE");
+  render();
+}
+
+void loop() {
+  updateLeds();
+  serviceUsb();
+  buttons();
+  applySettings();
+  // Menus do not pause sending. A confirmed payload/interval edit bypasses
+  // the old deadline once; startTx then anchors the new interval to this send.
+  if (!applying && !txActive && !rfHalted && modeKnown && profileKnown) {
+    const uint32_t interval = everSent ? INTERVALS_MS[active.interval] : START_DELAY_MS;
+    const uint32_t since = millis() - (everSent ? lastTxStart : lastTxDone);
+    if (txPending || since >= interval) startTx();
+  }
+  render();
+  delay(1);
+}
