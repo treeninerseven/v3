@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: MIT
+#pragma once
+#include <stdint.h>
+
+namespace SettingsCore {
+constexpr uint8_t PAYLOADS[] = {15, 30, 50, 100, 245};
+constexpr uint32_t INTERVALS_MS[] = {10000, 30000, 60000, 600000, 1800000};
+constexpr uint8_t PAYLOAD_COUNT = sizeof(PAYLOADS) / sizeof(PAYLOADS[0]);
+constexpr uint8_t INTERVAL_COUNT = sizeof(INTERVALS_MS) / sizeof(INTERVALS_MS[0]);
+
+constexpr uint8_t firstAllowedInterval(uint8_t payloadIndex) {
+  return payloadIndex >= 4 ? 2 : payloadIndex >= 2 ? 1 : 0;
+}
+
+constexpr bool valid(uint8_t payloadIndex, uint8_t intervalIndex) {
+  return payloadIndex < PAYLOAD_COUNT && intervalIndex < INTERVAL_COUNT &&
+         intervalIndex >= firstAllowedInterval(payloadIndex);
+}
+
+// Number of choices before the Back row in each setting's submenu.
+constexpr uint8_t optionCount(uint8_t settingRow, uint8_t payloadIndex) {
+  return settingRow == 0 ? 2 : settingRow == 1 ? 4 :
+         settingRow == 2 ? 2 : settingRow == 3 ? PAYLOAD_COUNT :
+         settingRow == 4 ? INTERVAL_COUNT - firstAllowedInterval(payloadIndex) : 0;
+}
+
+constexpr uint8_t intervalFromOption(uint8_t payloadIndex, uint8_t option) {
+  return firstAllowedInterval(payloadIndex) + option;
+}
+
+constexpr uint8_t moveSelection(uint8_t current, uint8_t rows, int8_t direction) {
+  return direction < 0 ? (current == 0 ? rows - 1 : current - 1)
+                       : (current + 1 == rows ? 0 : current + 1);
+}
+
+constexpr uint8_t cycleInterval(uint8_t payloadIndex, uint8_t current, int8_t direction) {
+  const uint8_t minimum = firstAllowedInterval(payloadIndex);
+  if (direction < 0) return current <= minimum ? INTERVAL_COUNT - 1 : current - 1;
+  return current + 1 >= INTERVAL_COUNT ? minimum : current + 1;
+}
+}  // namespace SettingsCore
